@@ -1,337 +1,243 @@
---1.1
--- Task: show all animation movies released between 2017 and 2019 with rate more than 1, sorted alphabetically.
--- Interpretation: rate is rental_rate. between is like [] in math, thus all years are included.
---CTE
--- Join effect: the INNER JOINs act as filters, so only animated films remain.
-WITH animation_films AS (
-SELECT film_id
-FROM public.film_category
-INNER JOIN public.category USING (category_id)
-WHERE name = 'Animation'
-)
-SELECT title, release_year, rental_rate
-FROM public.film
-INNER JOIN animation_films USING (film_id)
-WHERE release_year BETWEEN 2017 AND 2019
-AND rental_rate > 1
-ORDER BY title;
-
--- Subquery
--- Join effect: no joins here, IN works as a filter, so only animated films remain.
-SELECT title, release_year, rental_rate
-FROM public.film
-WHERE release_year BETWEEN 2017 AND 2019
-AND rental_rate > 1
-AND film_id IN (
-SELECT film_id
-FROM public.film_category
-WHERE category_id IN (
-SELECT category_id
-FROM public.category
-WHERE name = 'Animation'
-)
-)
-ORDER BY title;
-
--- JOIN
--- Join effect: the INNER JOINs act as filters, so only animated films remain.
-SELECT title, release_year, rental_rate
-FROM public.film
-INNER JOIN public.film_category USING (film_id)
-INNER JOIN public.category USING (category_id)
-WHERE name = 'Animation'
-AND release_year BETWEEN 2017 AND 2019
-AND rental_rate > 1
-ORDER BY title;
-
--- JOIN is the best variant here due to being the shortest and the easiest.
---1.2
--- Task: calculate the revenue earned by each rental store since April 2017 (columns: address and address2 as one column, revenue).
--- Interpretation: a payment belongs to the store that owns the rented inventory item. address2 is empty or NULL
--- for the stores, so CONCAT_WS with NULLIF skips it and there is no NULL or extra space in the address.
-
--- CTE
--- Join effect: the INNER JOINs inside the CTE keep only payments that have a rental and an inventory item.
--- LEFT JOIN keeps a store even if it had no sales, COALESCE turns its revenue into 0.
-WITH store_revenue AS (
-SELECT store_id, SUM(amount) AS revenue
-FROM public.payment
-INNER JOIN public.rental USING (rental_id)
-INNER JOIN public.inventory USING (inventory_id)
-WHERE payment_date >= DATE '2017-04-01'
-GROUP BY store_id
-)
-SELECT
-NULLIF(CONCAT_WS(' ', address, NULLIF(TRIM(address2), '')), '') AS address,
-COALESCE(revenue, 0) AS revenue
-FROM public.store
-INNER JOIN public.address USING (address_id)
-LEFT JOIN store_revenue USING (store_id)
-ORDER BY revenue DESC;
-
--- Subquery
--- Join effect: no joins here, every store stays in the result, and a store without sales gets revenue 0 from COALESCE.
-SELECT
-(
-SELECT NULLIF(CONCAT_WS(' ', address, NULLIF(TRIM(address2), '')), '')
-FROM public.address
-WHERE address_id = s.address_id
-) AS address,
-COALESCE((
-SELECT SUM(amount)
-FROM public.payment
-WHERE payment_date >= DATE '2017-04-01'
-AND rental_id IN (
-SELECT rental_id
-FROM public.rental
-WHERE inventory_id IN (
-SELECT inventory_id
-FROM public.inventory
-WHERE store_id = s.store_id
-)
-)
-), 0) AS revenue
-FROM public.store AS s
-ORDER BY revenue DESC;
-
--- JOIN
--- Join effect: the LEFT JOINs keep a store even if it has no sales. The date filter is in the ON clause,
--- if it was in WHERE, the LEFT JOIN would work like an INNER JOIN and stores without sales would disappear.
-SELECT
-NULLIF(CONCAT_WS(' ', a.address, NULLIF(TRIM(a.address2), '')), '') AS address,
-COALESCE(SUM(p.amount), 0) AS revenue
-FROM public.store AS s
-INNER JOIN public.address AS a ON a.address_id = s.address_id
-LEFT JOIN public.inventory AS i ON i.store_id = s.store_id
-LEFT JOIN public.rental AS r ON r.inventory_id = i.inventory_id
-LEFT JOIN public.payment AS p ON p.rental_id = r.rental_id
-AND p.payment_date >= DATE '2017-04-01'
-GROUP BY s.store_id, a.address, a.address2
-ORDER BY revenue DESC;
-
--- CTE is the best variant here, because it sums the big payment table first and only then adds the address.
-
-
---1.3
--- Task: show top-5 actors by number of movies released since 2015 (first_name, last_name, number_of_movies), sorted by number_of_movies descending.
--- Interpretation: since 2015 means 2015 is included. Actors are grouped by actor_id, because two actors can have the same name.
--- Places 4-7 are tied with 10 films, so the name decides who is 5th.
-
--- CTE
--- Join effect: the INNER JOINs drop actors without films since 2015, they cannot be in the top-5 anyway.
-WITH recent_films AS (
-SELECT film_id
-FROM public.film
-WHERE release_year >= 2015
-),
-actor_counts AS (
-SELECT actor_id, COUNT(*) AS number_of_movies
-FROM public.film_actor
-INNER JOIN recent_films USING (film_id)
-GROUP BY actor_id
-)
-SELECT first_name, last_name, number_of_movies
-FROM actor_counts
-INNER JOIN public.actor USING (actor_id)
-ORDER BY number_of_movies DESC, first_name, last_name
-LIMIT 5;
-
--- Subquery
--- Join effect: no joins here, the count is calculated for every actor (even those with 0 films), and only then the top-5 is cut.
-SELECT
-first_name,
-last_name,
-(
-SELECT COUNT(*)
-FROM public.film_actor
-WHERE actor_id = a.actor_id
-AND film_id IN (
-SELECT film_id
-FROM public.film
-WHERE release_year >= 2015
-)
-) AS number_of_movies
-FROM public.actor AS a
-ORDER BY number_of_movies DESC, first_name, last_name
-LIMIT 5;
-
--- JOIN
--- Join effect: the INNER JOINs drop actors without films since 2015, they cannot be in the top-5 anyway.
-SELECT first_name, last_name, COUNT(film_id) AS number_of_movies
-FROM public.actor
-INNER JOIN public.film_actor USING (actor_id)
-INNER JOIN public.film USING (film_id)
-WHERE release_year >= 2015
-GROUP BY actor_id, first_name, last_name
-ORDER BY number_of_movies DESC, first_name, last_name
-LIMIT 5;
-
--- JOIN is the best variant here due to being the shortest and doing one pass over the data.
---1.4
---CTE
--- Join effect: the INNER JOINs inside genre_films keep only films of the 3 genres. The LEFT JOIN keeps years
--- without such films, their counts are NULL, so COALESCE turns them into 0.
-WITH genre_films AS (
-SELECT release_year, name
-FROM public.film
-INNER JOIN public.film_category USING (film_id)
-INNER JOIN public.category USING (category_id)
-WHERE name IN ('Drama', 'Travel', 'Documentary')),
-genre_counts AS (
-select release_year,
-COUNT(*) FILTER (WHERE name = 'Drama') AS number_of_drama_movies,
-COUNT(*) FILTER (WHERE name = 'Travel') AS number_of_travel_movies,
-COUNT(*) FILTER (WHERE name = 'Documentary') AS number_of_documentary_movies
-FROM genre_films
-GROUP BY release_year),
-all_years AS (
-SELECT DISTINCT release_year FROM public.film)
-select release_year,
-COALESCE(number_of_drama_movies, 0) AS number_of_drama_movies,
-COALESCE(number_of_travel_movies, 0) AS number_of_travel_movies,
-COALESCE(number_of_documentary_movies, 0) AS number_of_documentary_movies
-FROM all_years
-LEFT JOIN genre_counts USING (release_year)
-ORDER BY release_year DESC;
---Subquery
--- Join effect: no joins here, every year from the list stays in the result, and COUNT gives 0 when there are no films.
-SELECT
-y.release_year,( SELECT COUNT(*) FROM public.film
-WHERE release_year = y.release_year
-AND film_id IN (
-SELECT film_id FROM public.film_category
-WHERE category_id IN (
-SELECT category_id
-FROM public.category
-WHERE name = 'Drama'))) AS number_of_drama_movies,
-(SELECT COUNT(*) FROM public.film
-WHERE release_year = y.release_year
-AND film_id IN (
-SELECT film_id FROM public.film_category
-WHERE category_id IN (
-SELECT category_idFROM public.category
-WHERE name = 'Travel'))) AS number_of_travel_movies,
-(SELECT COUNT(*) FROM public.film
-WHERE release_year = y.release_year
-AND film_id IN ( SELECT film_id FROM public.film_category
-WHERE category_id IN (
-SELECT category_idFROM public.category
-WHERE name = 'Documentary'))) AS number_of_documentary_movies
-FROM ( SELECT DISTINCT release_yearFROM public.film) AS y
-ORDER BY y.release_year DESC;
---JOIN
--- Join effect: the LEFT JOINs start from film, so every year stays in the result even if the film has no category
--- or belongs to another genre. COUNT ignores NULLs, so such years show 0.
-SELECT
-SELECT
-release_year,
-COUNT(CASE WHEN name = 'Drama' THEN film_id END) AS number_of_drama_movies,
-COUNT(CASE WHEN name = 'Travel' THEN film_id END) AS number_of_travel_movies,
-COUNT(CASE WHEN name = 'Documentary' THEN film_id END) AS number_of_documentary_movies
-FROM public.film
-LEFT JOIN public.film_category USING (film_id)
-LEFT JOIN public.category USING (category_id)
-GROUP BY release_year
-ORDER BY release_year DESC;
--- JOIN is the best variant here due to being the shortest and reading each table only once.
-
-
-
-
---2.1
-WITH revenue AS ( SELECT staff_id, SUM(amount) AS total_revenue FROM payment
-    WHERE payment_date >= '2017-01-01'
-      AND payment_date <  '2018-01-01'
-    GROUP BY staff_id
-),
-last_store AS (
-    SELECT staff_id, store_id
-    FROM (
-        SELECT p.staff_id, i.store_id,
-               ROW_NUMBER() OVER (PARTITION BY p.staff_id
-                                  ORDER BY p.payment_date DESC, p.payment_id DESC) AS rn
-        FROM payment p
-        JOIN rental    r ON r.rental_id    = p.rental_id
-        JOIN inventory i ON i.inventory_id = r.inventory_id
-        WHERE p.payment_date >= '2017-01-01'
-          AND p.payment_date <  '2018-01-01'
-    ) t
-    WHERE rn = 1
-)
-SELECT s.staff_id, s.first_name, s.last_name,
-       ls.store_id AS last_store_id, rv.total_revenue
-FROM revenue rv
-JOIN staff       s  ON s.staff_id  = rv.staff_id
-JOIN last_store  ls ON ls.staff_id = rv.staff_id
-ORDER BY rv.total_revenue DESC
-LIMIT 3;
-
---2.2
-SELECT f.film_id, f.title, f.rating,
-       COUNT(r.rental_id) AS rental_count,
-       CASE f.rating
-            WHEN 'G' THEN 'All ages'
-            WHEN 'PG' THEN '8+ (parental guidance suggested)'
-            WHEN 'PG-13' THEN '13+'
-            WHEN 'R' THEN '17+ (under 17 only with an adult)'
-            WHEN 'NC-17' THEN '18+'
-       END AS expected_audience_age
-FROM film f
-JOIN inventory i ON i.film_id = f.film_id
-JOIN rental r ON r.inventory_id = i.inventory_id
-GROUP BY f.film_id, f.title, f.rating
-ORDER BY rental_count DESC, f.title
+SELECT c.customer_id, c.first_name, c.last_name,
+       (SELECT COUNT(*) FROM public.rental  r WHERE r.customer_id = c.customer_id) AS rentals,
+       (SELECT COUNT(*) FROM public.payment p WHERE p.customer_id = c.customer_id) AS payments
+FROM public.customer c
+WHERE (SELECT COUNT(*) FROM public.rental  r WHERE r.customer_id = c.customer_id) >= 43
+  AND (SELECT COUNT(*) FROM public.payment p WHERE p.customer_id = c.customer_id) >= 43
+ORDER BY c.customer_id
 LIMIT 5;
 
 
+BEGIN;
+-- Separate transaction: the 3 films are one logical unit. All are added or none.
+-- If it fails: PostgreSQL aborts the transaction and nothing is written.
+--   ROLLBACK is possible; only these uncommitted film rows are affected.
+-- Referential integrity: language_id is looked up from public.language by name,
+--   so the FK film.language_id -> language is always valid.
+-- Uniqueness: WHERE NOT EXISTS on the title, so reruns insert 0 rows.
+-- Why INSERT ... SELECT instead of VALUES: IDs are resolved from the data itself, so the
+--   script works on any copy of the DB, and filters like NOT EXISTS can be applied to source rows.
 
---3.1
-SELECT a.actor_id,
-       a.first_name,
-       a.last_name,
-       MAX(f.release_year)                                          AS last_release_year,
-       EXTRACT(YEAR FROM CURRENT_DATE) - MAX(f.release_year)   AS years_inactive
-FROM actor a
-JOIN film_actor fa ON fa.actor_id = a.actor_id
-JOIN film       f  ON f.film_id   = fa.film_id
-GROUP BY a.actor_id, a.first_name, a.last_name
-ORDER BY years_inactive DESC, a.last_name, a.first_name;
+INSERT INTO public.film
+      (title, description, release_year, language_id, rental_duration,
+       rental_rate, length, replacement_cost, rating, last_update)
+SELECT v.title, v.description, v.release_year, l.language_id, v.rental_duration,
+       v.rental_rate, v.length, v.replacement_cost, v.rating::public.mpaa_rating, current_date
+FROM (VALUES
+  ('THE ODYSSEY',
+   'Christopher Nolan''s epic adaptation of Homer''s journey of Odysseus returning home from the Trojan War.',
+   2026, 7,  4.99, 170, 19.99, 'PG-13'),
+  ('CLICK',
+   'An overworked architect finds a universal remote that lets him fast-forward through his own life.',
+   2006, 14, 9.99, 107, 19.99, 'PG-13'),
+  ('THE TRUMAN SHOW',
+   'An insurance salesman slowly discovers that his whole life is a TV show watched by millions.',
+   1998, 21, 19.99, 103, 19.99, 'PG')
+) AS v(title, description, release_year, rental_duration, rental_rate, length, replacement_cost, rating)
+CROSS JOIN (SELECT language_id FROM public.language WHERE name = 'English' LIMIT 1) l
+WHERE NOT EXISTS (SELECT 1 FROM public.film f WHERE UPPER(f.title) = v.title)
+RETURNING film_id, title, release_year, rental_duration, rental_rate;
 
---3.2
---one row per gap
-WITH actor_years AS (
-    SELECT DISTINCT fa.actor_id, f.release_year
-    FROM film_actor fa
-    JOIN film f ON f.film_id = fa.film_id
-),
-gaps AS (
-    SELECT actor_id, LAG(release_year) OVER (PARTITION BY actor_id ORDER BY release_year) AS prev_year, release_year                                                         AS next_year
-    FROM actor_years
-)
-SELECT a.actor_id, a.first_name, a.last_name,
-       g.prev_year, g.next_year, g.next_year - g.prev_year AS gap_years
-FROM gaps g
-JOIN actor a ON a.actor_id = g.actor_id
-WHERE g.prev_year IS NOT NULL
-ORDER BY gap_years DESC, a.last_name, a.first_name;
--- one row per actor
-WITH actor_years AS (
-    SELECT DISTINCT fa.actor_id, f.release_year
-    FROM film_actor fa
-    JOIN film f ON f.film_id = fa.film_id
-),
-gaps AS (
-    SELECT actor_id,
-           release_year - LAG(release_year) OVER (PARTITION BY actor_id ORDER BY release_year) AS gap_years
-    FROM actor_years
-)
-SELECT a.actor_id,
-       a.first_name,
-       a.last_name,
-       MAX(g.gap_years)           AS longest_break_years,
-       ROUND(AVG(g.gap_years), 2) AS avg_gap_years
-FROM gaps g
-JOIN actor a ON a.actor_id = g.actor_id
-WHERE g.gap_years IS NOT NULL
-GROUP BY a.actor_id, a.first_name, a.last_name
-ORDER BY longest_break_years DESC, a.last_name, a.first_name;
+INSERT INTO public.film_category (film_id, category_id, last_update)
+SELECT f.film_id, c.category_id, current_date
+FROM (VALUES ('THE ODYSSEY','Action'), ('CLICK','Comedy'), ('THE TRUMAN SHOW','Drama')) v(title, cat)
+JOIN public.film f     ON UPPER(f.title) = v.title
+JOIN public.category c ON c.name = v.cat
+ON CONFLICT (film_id, category_id) DO NOTHING
+RETURNING film_id, category_id;
+
+COMMIT;
+
+
+BEGIN;
+-- Separate transaction: actors and their film links belong together,
+--   so no actor is left without a film.
+-- If it fails: everything in this block is undone; films from step 1 stay intact.
+--   ROLLBACK is possible and only affects actor/film_actor rows of this block.
+-- Duplicate detection: "actor" has no natural unique key, so an actor already exists if
+--   UPPER(first_name) + UPPER(last_name) match. Existing actors are reused, never duplicated.
+-- Relationships: film_actor gets actor_id and film_id via JOINs on names/titles, so the FKs
+--   are valid because the IDs come from the parent tables.
+
+INSERT INTO public.actor (first_name, last_name, last_update)
+SELECT v.fn, v.ln, current_date
+FROM (VALUES
+  ('MATT','DAMON'), ('TOM','HOLLAND'), ('ANNE','HATHAWAY'),
+  ('ADAM','SANDLER'), ('KATE','BECKINSALE'), ('CHRISTOPHER','WALKEN'),
+  ('JIM','CARREY'), ('LAURA','LINNEY'), ('ED','HARRIS')
+) AS v(fn, ln)
+WHERE NOT EXISTS (SELECT 1 FROM public.actor a
+                  WHERE UPPER(a.first_name) = v.fn AND UPPER(a.last_name) = v.ln)
+RETURNING actor_id, first_name, last_name;
+
+INSERT INTO public.film_actor (actor_id, film_id, last_update)
+SELECT a.actor_id, f.film_id, current_date
+FROM (VALUES
+  ('THE ODYSSEY','MATT','DAMON'), ('THE ODYSSEY','TOM','HOLLAND'), ('THE ODYSSEY','ANNE','HATHAWAY'),
+  ('CLICK','ADAM','SANDLER'), ('CLICK','KATE','BECKINSALE'), ('CLICK','CHRISTOPHER','WALKEN'),
+  ('THE TRUMAN SHOW','JIM','CARREY'), ('THE TRUMAN SHOW','LAURA','LINNEY'), ('THE TRUMAN SHOW','ED','HARRIS')
+) AS v(title, fn, ln)
+JOIN public.film  f ON UPPER(f.title) = v.title
+JOIN public.actor a ON UPPER(a.first_name) = v.fn AND UPPER(a.last_name) = v.ln
+ON CONFLICT (actor_id, film_id) DO NOTHING
+RETURNING actor_id, film_id;
+
+COMMIT;
+
+
+BEGIN;
+-- Separate transaction: the identity change must be atomic (name, email, address together).
+-- If it fails: the customer keeps their old data. ROLLBACK is possible; only one customer row is affected.
+-- Address: an existing address_id is reused; public.address is NOT modified.
+-- Rerun safety: NOT EXISTS on my email skips the update once it has been done.
+-- Integrity: address_id comes from address, and customer_id stays the same,
+--   so all child rows (rental/payment) still point to the same customer.
+
+-- Preview of the row that will change (check before COMMIT):
+SELECT customer_id, first_name, last_name, email, address_id
+FROM public.customer c
+WHERE (SELECT COUNT(*) FROM public.rental  r WHERE r.customer_id = c.customer_id) >= 43
+  AND (SELECT COUNT(*) FROM public.payment p WHERE p.customer_id = c.customer_id) >= 43
+ORDER BY customer_id LIMIT 1;
+
+UPDATE public.customer c
+SET first_name  = 'MARTA',
+    last_name   = 'GONTAR',
+    email       = 'mhontar@kse.org.ua',
+    address_id  = (SELECT MIN(a.address_id) FROM public.address a),
+    last_update = current_date
+WHERE c.customer_id = (
+        SELECT c2.customer_id FROM public.customer c2
+        WHERE (SELECT COUNT(*) FROM public.rental  r WHERE r.customer_id = c2.customer_id) >= 43
+          AND (SELECT COUNT(*) FROM public.payment p WHERE p.customer_id = c2.customer_id) >= 43
+        ORDER BY c2.customer_id LIMIT 1)
+  AND NOT EXISTS (SELECT 1 FROM public.customer x WHERE x.email = 'mhontar@kse.org.ua')
+RETURNING customer_id, first_name, last_name, email, address_id, store_id, last_update;
+
+COMMIT;
+
+
+BEGIN;
+-- Separate transaction: inventory is a standalone unit of work (stock must exist before rentals).
+-- If it fails: no stock is added, and step 6 inserts nothing because it finds no inventory.
+--   ROLLBACK is possible; only these inventory rows are affected.
+-- Store: resolved from customer.store_id (by email), not hardcoded.
+-- Uniqueness: WHERE NOT EXISTS (film_id + store_id) means one copy per film per store.
+-- Integrity: film_id and store_id come from the parent tables, so the FKs are valid.
+
+INSERT INTO public.inventory (film_id, store_id, last_update)
+SELECT f.film_id, c.store_id, current_date
+FROM public.film f
+CROSS JOIN public.customer c
+WHERE c.email = 'mhontar@kse.org.ua'
+  AND UPPER(f.title) IN ('THE ODYSSEY','CLICK','THE TRUMAN SHOW')
+  AND NOT EXISTS (SELECT 1 FROM public.inventory i
+                  WHERE i.film_id = f.film_id AND i.store_id = c.store_id)
+RETURNING inventory_id, film_id, store_id;
+
+COMMIT;
+
+
+BEGIN;
+-- Separate transaction: a destructive operation is isolated so it can be rolled back on its own.
+-- If it fails: nothing is deleted. Before COMMIT, ROLLBACK restores everything;
+--   after COMMIT it cannot be undone, which is why the previews come first.
+-- Why safe: only rows with customer_id = MY customer are touched (found by email, never by
+--   hardcoded ID). Customer and Inventory rows are NOT deleted. Payments are deleted before
+--   rentals (child before parent), so there are no FK violations.
+-- No unintended loss: the WHERE excludes rentals of my 3 films, so a rerun does not wipe
+--   the rentals created in step 6.
+
+-- Preview (expect roughly 43+ each on the first run):
+SELECT 'payment' AS tbl, COUNT(*) FROM public.payment p
+ JOIN public.customer c ON c.customer_id = p.customer_id AND c.email = 'mhontar@kse.org.ua'
+ WHERE p.rental_id IS NULL OR p.rental_id NOT IN (
+        SELECT r.rental_id FROM public.rental r
+        JOIN public.inventory i ON i.inventory_id = r.inventory_id
+        JOIN public.film f ON f.film_id = i.film_id
+        WHERE UPPER(f.title) IN ('THE ODYSSEY','CLICK','THE TRUMAN SHOW'))
+UNION ALL
+SELECT 'rental', COUNT(*) FROM public.rental r
+ JOIN public.customer c ON c.customer_id = r.customer_id AND c.email = 'mhontar@kse.org.ua'
+ WHERE r.inventory_id NOT IN (
+        SELECT i.inventory_id FROM public.inventory i
+        JOIN public.film f ON f.film_id = i.film_id
+        WHERE UPPER(f.title) IN ('THE ODYSSEY','CLICK','THE TRUMAN SHOW'));
+
+DELETE FROM public.payment p
+USING public.customer c
+WHERE c.customer_id = p.customer_id
+  AND c.email = 'mhontar@kse.org.ua'
+  AND (p.rental_id IS NULL OR p.rental_id NOT IN (
+        SELECT r.rental_id FROM public.rental r
+        JOIN public.inventory i ON i.inventory_id = r.inventory_id
+        JOIN public.film f ON f.film_id = i.film_id
+        WHERE UPPER(f.title) IN ('THE ODYSSEY','CLICK','THE TRUMAN SHOW')))
+RETURNING p.payment_id, p.customer_id, p.rental_id;
+
+DELETE FROM public.rental r
+USING public.customer c
+WHERE c.customer_id = r.customer_id
+  AND c.email = 'mhontar@kse.org.ua'
+  AND r.inventory_id NOT IN (
+        SELECT i.inventory_id FROM public.inventory i
+        JOIN public.film f ON f.film_id = i.film_id
+        WHERE UPPER(f.title) IN ('THE ODYSSEY','CLICK','THE TRUMAN SHOW'))
+RETURNING r.rental_id, r.customer_id, r.inventory_id;
+
+COMMIT;
+
+
+BEGIN;
+-- Separate transaction: a rental and its payment must be created together,
+--   otherwise there would be rentals without payment.
+-- If it fails: both inserts are rolled back, leaving no half-finished state.
+--   ROLLBACK is possible and only affects rental/payment rows of this block.
+-- Relationships: inventory_id comes from inventory (film in my store), customer_id from customer,
+--   staff_id from a staff member of the same store, payment.rental_id from the rental just created.
+-- Uniqueness: rentals are guarded by NOT EXISTS (inventory + customer + rental_date),
+--   which matches the table's unique index; payments by NOT EXISTS on rental_id.
+-- Amount = the film's rental_rate (4.99 / 9.99 / 19.99). Dates are in H1 2017, which fits
+--   the payment partitions. If one is missing, create it first, e.g.:
+--   CREATE TABLE IF NOT EXISTS public.payment_p2017_02 PARTITION OF public.payment
+--     FOR VALUES FROM ('2017-02-01') TO ('2017-03-01');   -- likewise for 03 and 04
+
+INSERT INTO public.rental (rental_date, inventory_id, customer_id, return_date, staff_id, last_update)
+SELECT v.rental_date, i.inventory_id, c.customer_id,
+       v.rental_date + f.rental_duration * INTERVAL '1 day',
+       s.staff_id, current_date
+FROM (VALUES
+  ('THE TRUMAN SHOW', TIMESTAMP '2017-02-10 10:00:00'),
+  ('CLICK',           TIMESTAMP '2017-03-12 15:30:00'),
+  ('THE ODYSSEY',     TIMESTAMP '2017-04-05 19:45:00')
+) AS v(title, rental_date)
+JOIN public.film      f ON UPPER(f.title) = v.title
+JOIN public.customer  c ON c.email = 'mhontar@kse.org.ua'
+JOIN public.inventory i ON i.film_id = f.film_id AND i.store_id = c.store_id
+JOIN LATERAL (SELECT st.staff_id FROM public.staff st
+              WHERE st.store_id = i.store_id ORDER BY st.staff_id LIMIT 1) s ON TRUE
+WHERE NOT EXISTS (SELECT 1 FROM public.rental r
+                  WHERE r.inventory_id = i.inventory_id
+                    AND r.customer_id  = c.customer_id
+                    AND r.rental_date  = v.rental_date)
+RETURNING rental_id, rental_date, inventory_id, customer_id, staff_id, return_date;
+
+INSERT INTO public.payment (customer_id, staff_id, rental_id, amount, payment_date)
+SELECT r.customer_id, r.staff_id, r.rental_id, f.rental_rate, r.rental_date + INTERVAL '5 minutes'
+FROM public.rental r
+JOIN public.customer  c ON c.customer_id = r.customer_id AND c.email = 'mhontar@kse.org.ua'
+JOIN public.inventory i ON i.inventory_id = r.inventory_id
+JOIN public.film      f ON f.film_id = i.film_id
+WHERE UPPER(f.title) IN ('THE ODYSSEY','CLICK','THE TRUMAN SHOW')
+  AND NOT EXISTS (SELECT 1 FROM public.payment p WHERE p.rental_id = r.rental_id)
+RETURNING payment_id, customer_id, rental_id, amount, payment_date;
+
+COMMIT;
+
+
+SELECT c.customer_id, c.first_name, c.last_name, c.email,
+       (SELECT COUNT(*) FROM public.rental  r WHERE r.customer_id = c.customer_id) AS rentals,
+       (SELECT COUNT(*) FROM public.payment p WHERE p.customer_id = c.customer_id) AS payments
+FROM public.customer c
+WHERE c.email = 'mhontar@kse.org.ua';
+-- Expected: 3 rentals and 3 payments.
