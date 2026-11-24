@@ -40,18 +40,25 @@ Data type choices and the risk of the alternatives
 Data loading
 - No surrogate id is typed. Child rows come from INSERT ... SELECT joining the parent on its
   business key (line_code, station_name, train_number, type_name ...). A typo returns no row, so
-  nothing is inserted instead of a wrong link.
+  nothing is inserted instead of a wrong link. Text keys are compared with UPPER() on both sides,
+  so 'm1' and 'M1' find the same parent.
 - Reruns add nothing: ON CONFLICT DO NOTHING on UNIQUE business keys, or WHERE NOT EXISTS.
 - Data is loaded parent first, in DDL order, one transaction per group.
 - Triggers R1-R4 enforce cross-table rules during the load, so inconsistent rows (a stop from
   another line, a ticket sold under an expired price) are rejected.
 - Trigger R3 writes status history whenever a trip_run or work order is inserted or its status
   changes, so history never disagrees with the current status.
+- INSERT/UPDATE statements have no RETURNING: nothing in this script reads the returned rows.
+  The result of the load is checked once, in section 5.
 */
 
 -- 0. SCHEMA AND EXTENSION
--- Separate transaction: the schema and the extension are one unit; either both exist or neither.
--- If it fails: nothing is created. ROLLBACK is possible before COMMIT.
+-- CREATE SCHEMA creates a namespace inside the database we are connected to; it does NOT create
+-- a database. The script assumes the target database already exists (CREATE DATABASE is done
+-- beforehand, outside this script) and that we are connected to it.
+-- Both objects are created in one transaction: the tables of section 1 need both, so either both
+-- exist or neither. DDL is transactional in PostgreSQL, so a failure undoes both.
+-- IF NOT EXISTS makes a rerun harmless (it does not check that an existing schema is the same).
 BEGIN;
 
 CREATE SCHEMA IF NOT EXISTS subway;
@@ -62,9 +69,10 @@ CREATE EXTENSION IF NOT EXISTS btree_gist;
 COMMIT;
 
 -- 1. TABLES (parents first) WITH PK, FK, DEFAULT, CHECK, UNIQUE, NOT NULL, EXCLUDE
--- Separate transaction: the 18 tables are one logical model; a half-built model is useless.
--- If it fails: PostgreSQL aborts the transaction and no table of this block exists (DDL is
--- transactional in PostgreSQL). ROLLBACK is possible and loses nothing, because no data exists yet.
+-- The 18 tables are created in one transaction because they form one logical model: a model with
+-- missing tables cannot be used. If any statement fails, PostgreSQL rolls the whole block back and
+-- no table of this block exists, so the script can simply be fixed and run again.
+-- CREATE TABLE IF NOT EXISTS makes a rerun skip tables that exist (it does not alter them).
 BEGIN;
 
 -- ---- Level 1: tables without foreign keys ---------------------------------------------------
@@ -135,6 +143,20 @@ CREATE TABLE IF NOT EXISTS subway.maintenance_type (
   CONSTRAINT chk_maint_type_interval  CHECK (interval_days > 0)
 );
 
+-- ---- Level 2: tables that reference level 1 ------------------------------------------------
+
+-- Design note for the EXCLUDE constraints used in this level (line_station, schedule_version,
+-- ticket_type_station, ticket_price):
+-- These tables store history: the same business object has several rows, each valid for a period
+-- (valid_from .. valid_to). UNIQUE (object, valid_from) only stops two rows with the SAME start date;
+-- it does not stop periods that overlap (2026-01-01..2026-12-31 and 2026-06-01..NULL). An EXCLUDE
+-- constraint with the range overlap operator && forbids exactly that, inside the database, for
+-- every client and in concurrent sessions. Alternatives and why they were not chosen:
+--   - a trigger doing the overlap check: more code, and two parallel transactions can both pass
+--     the check before either commits (race condition); EXCLUDE is checked atomically by the index;
+--   - a check in the application: other clients (scripts, manual SQL) can bypass it.
+-- Cost: the btree_gist extension and one GiST index per constraint, acceptable for small
+-- reference tables that are rarely written.
 
 CREATE TABLE IF NOT EXISTS subway.line_station (
   line_station_id INTEGER GENERATED ALWAYS AS IDENTITY,
@@ -193,6 +215,7 @@ CREATE TABLE IF NOT EXISTS subway.schedule_version (
   CONSTRAINT chk_schedule_version_from_2000 CHECK (valid_from > DATE '2000-01-01'),
   CONSTRAINT chk_schedule_version_period CHECK (valid_to >= valid_from),
   CONSTRAINT chk_schedule_version_self   CHECK (superseded_by_version_id <> schedule_version_id),
+  -- One line has only one timetable edition in force on any day.
   CONSTRAINT ex_schedule_version_period  EXCLUDE USING gist (
     line_id WITH =, daterange(valid_from, valid_to, '[]') WITH &&)
 );
@@ -211,6 +234,7 @@ CREATE TABLE IF NOT EXISTS subway.ticket_type_station (
   CONSTRAINT uq_tts             UNIQUE (ticket_type_id, station_id, valid_from),
   CONSTRAINT chk_tts_from_2000  CHECK (valid_from > DATE '2000-01-01'),
   CONSTRAINT chk_tts_period     CHECK (valid_to >= valid_from),
+  -- One ticket type has only one entry/exit rule per station on any day.
   CONSTRAINT ex_tts_period      EXCLUDE USING gist (
     ticket_type_id WITH =, station_id WITH =, daterange(valid_from, valid_to, '[]') WITH &&)
 );
@@ -231,6 +255,15 @@ CREATE TABLE IF NOT EXISTS subway.ticket_price (
   CONSTRAINT chk_ticket_price_hours  CHECK (validity_hours > 0),
   CONSTRAINT chk_ticket_price_from_2000 CHECK (valid_from > DATE '2000-01-01'),
   CONSTRAINT chk_ticket_price_period CHECK (valid_to >= valid_from),
+  -- Why EXCLUDE here: prices are versioned (a new row when the price changes). UNIQUE
+  -- (ticket_type_id, valid_from) cannot stop two prices of one ticket type from overlapping, e.g.
+  -- 20.00 valid 2024-01-01..2026-06-30 and 25.00 valid from 2026-01-01. A ticket bought in the
+  -- overlap would match two prices: the sale has no single correct price, revenue reports and the
+  -- price lookup used in the ticket INSERT would return two rows (a duplicated ticket).
+  -- daterange(valid_from, valid_to, '[]') turns the two columns into one closed period (an open
+  -- valid_to means "until further notice"), and && is the "periods overlap" operator.
+  -- A simpler UNIQUE or CHECK cannot compare one row with other rows, so EXCLUDE (backed by a GiST
+  -- index and the btree_gist extension) is the declarative way to do it; see the design note above.
   CONSTRAINT ex_ticket_price_period  EXCLUDE USING gist (
     ticket_type_id WITH =, daterange(valid_from, valid_to, '[]') WITH &&)
 );
@@ -253,6 +286,8 @@ CREATE TABLE IF NOT EXISTS subway.trip (
 );
 
 CREATE TABLE IF NOT EXISTS subway.ticket (
+  -- BIGINT GENERATED ALWAYS AS IDENTITY: the highest-volume table; the id is always generated by
+  -- the database and a manually typed id is rejected.
   ticket_id       BIGINT GENERATED ALWAYS AS IDENTITY,
   ticket_price_id INTEGER     NOT NULL,
   purchased_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -353,8 +388,26 @@ CREATE TABLE IF NOT EXISTS subway.work_order_status_history (
 COMMIT;
 
 -- 2. TRIGGER RULES R1-R4 (cross-table checks that a CHECK or FK cannot express)
--- Separate transaction: functions and triggers are installed together.
--- If it fails: no rule is installed; tables stay as they are. ROLLBACK is possible, no data affected.
+--
+-- Why triggers at all (design decision):
+--   - A CHECK constraint sees only the columns of the row being written.
+--   - A FOREIGN KEY only proves that the referenced row exists, not that it is the RIGHT one.
+--   So rules that compare data of different tables cannot be written declaratively:
+--     R1  a trip_stop must use a line_station of the SAME line as its trip;
+--     R2  a ticket must use a price that was valid on the purchase day;
+--     R4  a schedule version may only be superseded by a version of the same line.
+--   Alternative for R1/R4: composite foreign keys (copy line_id into trip, trip_stop and
+--   schedule_version). It would work without code, but stores the same fact in several tables
+--   (a 3NF violation) and was rejected. Alternative: checks in the application, which any other
+--   client or manual SQL can bypass. A trigger runs inside the database for every writer.
+--   R3  (status history) is needed so the history table always agrees with the current status,
+--       whichever client changes it; see the comment at R3.
+--   Trade-offs: a trigger costs one extra query per written row, is not fired by TRUNCATE, and
+--   R2 is not re-checked if a ticket_price period is edited later. This is accepted because tickets
+--   are inserted, not edited, and prices are versioned by adding rows.
+--
+-- The functions and triggers form one unit, so they are installed in one transaction: if one
+-- statement fails, no rule is half-installed. Tables and data are not touched.
 -- Rerunnable: CREATE OR REPLACE FUNCTION and DROP TRIGGER IF EXISTS + CREATE TRIGGER.
 BEGIN;
 
@@ -409,8 +462,19 @@ CREATE TRIGGER trg_ticket_price_valid
   FOR EACH ROW EXECUTE FUNCTION subway.fn_ticket_price_valid();
 
 -- R3: every insert and every status change is written to the status history table.
--- clock_timestamp() (not now()) gives each change its own moment even inside one transaction,
--- so UNIQUE (id, changed_at) is not violated by two quick changes.
+-- Why a trigger and not application code: the history must never disagree with the current status.
+-- If every client had to write the history row itself, one forgotten statement (or a manual
+-- UPDATE in psql) would silently change the status without a trace. The trigger makes it impossible
+-- to change the status without leaving a history row.
+-- Design choices:
+--   - AFTER triggers: the status row is already written and valid (all CHECKs passed) when the
+--     history row is created, so a rejected change never produces history.
+--   - Two triggers per table: one AFTER INSERT (the first status) and one AFTER UPDATE OF status
+--     with WHEN (OLD IS DISTINCT FROM NEW), so an UPDATE that does not change the status writes nothing.
+--   - clock_timestamp() (not now()) gives each change its own moment even inside one transaction,
+--     because now() is frozen at transaction start and two quick changes would violate
+--     UNIQUE (id, changed_at).
+--   - RETURN NULL: the return value of an AFTER row trigger is ignored.
 CREATE OR REPLACE FUNCTION subway.fn_trip_run_status_history()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -434,6 +498,7 @@ CREATE TRIGGER trg_trip_run_hist_upd
   WHEN (OLD.run_status IS DISTINCT FROM NEW.run_status)
   EXECUTE FUNCTION subway.fn_trip_run_status_history();
 
+-- R3 (second table): the same design for work orders.
 CREATE OR REPLACE FUNCTION subway.fn_work_order_status_history()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -486,6 +551,12 @@ COMMIT;
 -- Why INSERT ... SELECT instead of INSERT ... VALUES: foreign key ids are resolved by joining the
 -- parent tables, so the script works on any copy of the database and a wrong business key inserts
 -- nothing rather than a wrong link. Existence filters (NOT EXISTS) can also be applied to the source rows.
+-- Why UPPER() on both sides of text joins: the match must not depend on the letter case of the
+-- typed value ('m1' = 'M1'). Trade-off: UPPER(column) cannot use the plain unique index on that
+-- column; this is accepted because the lookup tables have only a few rows. For big tables a
+-- unique index on UPPER(column) or the citext type would be used instead.
+-- Why no RETURNING: no later statement uses the returned ids (children are found by business key),
+-- so RETURNING would only print result sets nobody reads. Row counts are checked in section 5.
 -- Each block below is its own transaction: a parent and the children that depend on it are loaded
 -- together; if one statement fails, that block is rolled back (nothing half-loaded) and blocks that
 -- were already committed stay valid because they never depend on later blocks.
@@ -500,8 +571,7 @@ FROM (VALUES
   ('WEEKEND', 'Weekend service'),
   ('HOLIDAY', 'Public holiday service')
 ) AS v (code, name)
-ON CONFLICT (service_pattern_code) DO NOTHING
-RETURNING service_pattern_id, service_pattern_code;
+ON CONFLICT (service_pattern_code) DO NOTHING;
 
 INSERT INTO subway.line (line_code, line_name, in_service_date)
 SELECT v.code, v.name, v.in_service
@@ -510,8 +580,7 @@ FROM (VALUES
   ('M2', 'Blue Line',  DATE '2022-09-01'),
   ('M3', 'Green Line', DATE '2024-06-01')
 ) AS v (code, name, in_service)
-ON CONFLICT (line_code) DO NOTHING
-RETURNING line_id, line_code;
+ON CONFLICT (line_code) DO NOTHING;
 
 INSERT INTO subway.station (station_name, in_service_date)
 SELECT v.name, v.in_service
@@ -521,8 +590,7 @@ FROM (VALUES
   ('Airport',        DATE '2020-05-01'),
   ('Old Town',       DATE '2022-09-01')
 ) AS v (name, in_service)
-ON CONFLICT (station_name) DO NOTHING
-RETURNING station_id, station_name;
+ON CONFLICT (station_name) DO NOTHING;
 
 INSERT INTO subway.train (train_number, capacity, in_service_date)
 SELECT v.number, v.capacity, v.in_service
@@ -531,14 +599,12 @@ FROM (VALUES
   ('T-102',  900, DATE '2020-04-01'),
   ('T-201', 1100, DATE '2022-08-01')
 ) AS v (number, capacity, in_service)
-ON CONFLICT (train_number) DO NOTHING
-RETURNING train_id, train_number;
+ON CONFLICT (train_number) DO NOTHING;
 
 INSERT INTO subway.ticket_type (type_name)
 SELECT v.name
 FROM (VALUES ('Single ride'), ('Day pass'), ('Monthly pass')) AS v (name)
-ON CONFLICT (type_name) DO NOTHING
-RETURNING ticket_type_id, type_name;
+ON CONFLICT (type_name) DO NOTHING;
 
 INSERT INTO subway.maintenance_type (type_name, description, interval_days)
 SELECT v.name, v.description, v.interval_days
@@ -547,8 +613,7 @@ FROM (VALUES
   ('Track inspection',  'Rail geometry and wear check',     90),
   ('Escalator service', NULL,                               NULL)
 ) AS v (name, description, interval_days)
-ON CONFLICT (type_name) DO NOTHING
-RETURNING maintenance_type_id, type_name;
+ON CONFLICT (type_name) DO NOTHING;
 
 COMMIT;
 
@@ -564,10 +629,9 @@ FROM (VALUES
   ('M2', 'Central Square', 1, DATE '2022-09-01'),
   ('M2', 'Old Town',       2, DATE '2022-09-01')
 ) AS v (line_code, station_name, stop_sequence, valid_from)
-JOIN subway.line    l ON l.line_code    = v.line_code
-JOIN subway.station s ON s.station_name = v.station_name
-ON CONFLICT DO NOTHING   -- also covers the second UNIQUE and the EXCLUDE constraints
-RETURNING line_station_id, line_id, station_id, stop_sequence;
+JOIN subway.line    l ON UPPER(l.line_code)    = UPPER(v.line_code)
+JOIN subway.station s ON UPPER(s.station_name) = UPPER(v.station_name)
+ON CONFLICT DO NOTHING;   -- also covers the second UNIQUE and the EXCLUDE constraints
 
 INSERT INTO subway.track_segment (from_station_id, to_station_id, length_m, in_service_date)
 SELECT sf.station_id, st.station_id, v.length_m, v.in_service
@@ -578,10 +642,9 @@ FROM (VALUES
   ('Airport',        'Central Square', 2400, DATE '2020-05-01'),
   ('Central Square', 'Old Town',       1600, DATE '2022-09-01')
 ) AS v (from_name, to_name, length_m, in_service)
-JOIN subway.station sf ON sf.station_name = v.from_name
-JOIN subway.station st ON st.station_name = v.to_name
-ON CONFLICT (from_station_id, to_station_id, in_service_date) DO NOTHING
-RETURNING track_segment_id, from_station_id, to_station_id, length_m;
+JOIN subway.station sf ON UPPER(sf.station_name) = UPPER(v.from_name)
+JOIN subway.station st ON UPPER(st.station_name) = UPPER(v.to_name)
+ON CONFLICT (from_station_id, to_station_id, in_service_date) DO NOTHING;
 
 COMMIT;
 
@@ -596,38 +659,36 @@ FROM (VALUES
   ('M1', DATE '2026-03-01'),
   ('M2', DATE '2022-09-01')
 ) AS v (line_code, valid_from)
-JOIN subway.line l ON l.line_code = v.line_code
-ON CONFLICT DO NOTHING
-RETURNING schedule_version_id, line_id, valid_from;
+JOIN subway.line l ON UPPER(l.line_code) = UPPER(v.line_code)
+ON CONFLICT DO NOTHING;
 
 INSERT INTO subway.schedule_version (line_id, valid_from, valid_to, superseded_by_version_id)
 SELECT l.line_id, DATE '2020-05-01', DATE '2026-02-28', nxt.schedule_version_id
 FROM subway.line l
 JOIN subway.schedule_version nxt ON nxt.line_id = l.line_id AND nxt.valid_from = DATE '2026-03-01'
-WHERE l.line_code = 'M1'
-ON CONFLICT DO NOTHING
-RETURNING schedule_version_id, line_id, valid_from, valid_to, superseded_by_version_id;
+WHERE UPPER(l.line_code) = UPPER('M1')
+ON CONFLICT DO NOTHING;
 
 -- trip has no UNIQUE key in the logical model, so duplicates are blocked with WHERE NOT EXISTS.
+-- direction is stored in upper case (CHECK chk_trip_direction), so the source value is upper-cased.
 INSERT INTO subway.trip (schedule_version_id, service_pattern_id, direction)
-SELECT sv.schedule_version_id, sp.service_pattern_id, v.direction
+SELECT sv.schedule_version_id, sp.service_pattern_id, UPPER(v.direction)
 FROM (VALUES
   ('M1', DATE '2026-03-01', 'WEEKDAY', 'OUTBOUND'),
   ('M1', DATE '2026-03-01', 'WEEKDAY', 'INBOUND'),
   ('M1', DATE '2026-03-01', 'WEEKEND', 'OUTBOUND'),
   ('M2', DATE '2022-09-01', 'WEEKDAY', 'OUTBOUND')
 ) AS v (line_code, version_from, pattern_code, direction)
-JOIN subway.line             l  ON l.line_code = v.line_code
+JOIN subway.line             l  ON UPPER(l.line_code) = UPPER(v.line_code)
 JOIN subway.schedule_version sv ON sv.line_id = l.line_id AND sv.valid_from = v.version_from
-JOIN subway.service_pattern  sp ON sp.service_pattern_code = v.pattern_code
+JOIN subway.service_pattern  sp ON UPPER(sp.service_pattern_code) = UPPER(v.pattern_code)
 WHERE NOT EXISTS (
   SELECT 1
   FROM subway.trip t
   WHERE t.schedule_version_id = sv.schedule_version_id
     AND t.service_pattern_id  = sp.service_pattern_id
-    AND t.direction           = v.direction
-)
-RETURNING trip_id, schedule_version_id, service_pattern_id, direction;
+    AND t.direction           = UPPER(v.direction)
+);
 
 -- The stop is found through the CURRENT position of the station on the line (valid_to IS NULL);
 -- trigger R1 additionally checks that the stop belongs to the line of the trip.
@@ -643,16 +704,15 @@ FROM (VALUES
   ('M2', DATE '2022-09-01', 'WEEKDAY', 'OUTBOUND', 'Central Square', TIME '06:30', TIME '06:30'),
   ('M2', DATE '2022-09-01', 'WEEKDAY', 'OUTBOUND', 'Old Town',       TIME '06:35', TIME '06:35')
 ) AS v (line_code, version_from, pattern_code, direction, station_name, arrival, departure)
-JOIN subway.line             l  ON l.line_code = v.line_code
+JOIN subway.line             l  ON UPPER(l.line_code) = UPPER(v.line_code)
 JOIN subway.schedule_version sv ON sv.line_id = l.line_id AND sv.valid_from = v.version_from
-JOIN subway.service_pattern  sp ON sp.service_pattern_code = v.pattern_code
+JOIN subway.service_pattern  sp ON UPPER(sp.service_pattern_code) = UPPER(v.pattern_code)
 JOIN subway.trip             t  ON t.schedule_version_id = sv.schedule_version_id
                                AND t.service_pattern_id  = sp.service_pattern_id
-                               AND t.direction           = v.direction
-JOIN subway.station          s  ON s.station_name = v.station_name
+                               AND UPPER(t.direction)    = UPPER(v.direction)
+JOIN subway.station          s  ON UPPER(s.station_name) = UPPER(v.station_name)
 JOIN subway.line_station     ls ON ls.line_id = l.line_id AND ls.station_id = s.station_id AND ls.valid_to IS NULL
-ON CONFLICT (trip_id, line_station_id) DO NOTHING
-RETURNING trip_stop_id, trip_id, line_station_id;
+ON CONFLICT (trip_id, line_station_id) DO NOTHING;
 
 -- Runs are inserted with the DEFAULT status PLANNED (trigger R3 writes the first history row).
 INSERT INTO subway.trip_run (trip_id, train_id, service_date)
@@ -662,29 +722,26 @@ FROM (VALUES
   ('M1', DATE '2026-03-01', 'WEEKDAY', 'INBOUND',  'T-102', DATE '2026-11-13'),
   ('M1', DATE '2026-03-01', 'WEEKDAY', 'OUTBOUND', 'T-101', DATE '2026-11-16')
 ) AS v (line_code, version_from, pattern_code, direction, train_number, service_date)
-JOIN subway.line             l  ON l.line_code = v.line_code
+JOIN subway.line             l  ON UPPER(l.line_code) = UPPER(v.line_code)
 JOIN subway.schedule_version sv ON sv.line_id = l.line_id AND sv.valid_from = v.version_from
-JOIN subway.service_pattern  sp ON sp.service_pattern_code = v.pattern_code
+JOIN subway.service_pattern  sp ON UPPER(sp.service_pattern_code) = UPPER(v.pattern_code)
 JOIN subway.trip             t  ON t.schedule_version_id = sv.schedule_version_id
                                AND t.service_pattern_id  = sp.service_pattern_id
-                               AND t.direction           = v.direction
-JOIN subway.train            tr ON tr.train_number = v.train_number
-ON CONFLICT (trip_id, service_date) DO NOTHING
-RETURNING trip_run_id, trip_id, train_id, service_date, run_status;
+                               AND UPPER(t.direction)    = UPPER(v.direction)
+JOIN subway.train            tr ON UPPER(tr.train_number) = UPPER(v.train_number)
+ON CONFLICT (trip_id, service_date) DO NOTHING;
 
 -- The two runs of 2026-11-13 are executed: PLANNED -> IN_PROGRESS -> COMPLETED. The status guards
 -- make a rerun update 0 rows, so no duplicate history rows are produced.
 UPDATE subway.trip_run
 SET run_status = 'IN_PROGRESS'
 WHERE service_date = DATE '2026-11-13'
-  AND run_status = 'PLANNED'
-RETURNING trip_run_id, run_status;
+  AND run_status = 'PLANNED';
 
 UPDATE subway.trip_run
 SET run_status = 'COMPLETED'
 WHERE service_date = DATE '2026-11-13'
-  AND run_status = 'IN_PROGRESS'
-RETURNING trip_run_id, run_status;
+  AND run_status = 'IN_PROGRESS';
 
 COMMIT;
 
@@ -694,16 +751,15 @@ BEGIN;
 INSERT INTO subway.ticket_type_station (ticket_type_id, station_id, can_enter, can_exit, valid_from)
 SELECT tt.ticket_type_id, s.station_id, v.can_enter, v.can_exit, v.valid_from
 FROM (VALUES
-  ('Single ride', 'University',     TRUE, TRUE, DATE '2020-05-01'),
-  ('Single ride', 'Central Square', TRUE, TRUE, DATE '2020-05-01'),
-  ('Single ride', 'Airport',        TRUE, TRUE, DATE '2020-05-01'),
-  ('Day pass',    'Central Square', TRUE, TRUE, DATE '2020-05-01'),
+  ('Single ride', 'University',     TRUE, TRUE,  DATE '2020-05-01'),
+  ('Single ride', 'Central Square', TRUE, TRUE,  DATE '2020-05-01'),
+  ('Single ride', 'Airport',        TRUE, TRUE,  DATE '2020-05-01'),
+  ('Day pass',    'Central Square', TRUE, TRUE,  DATE '2020-05-01'),
   ('Day pass',    'Airport',        TRUE, FALSE, DATE '2020-05-01')
 ) AS v (type_name, station_name, can_enter, can_exit, valid_from)
-JOIN subway.ticket_type tt ON tt.type_name    = v.type_name
-JOIN subway.station     s  ON s.station_name  = v.station_name
-ON CONFLICT DO NOTHING
-RETURNING ticket_type_station_id, ticket_type_id, station_id;
+JOIN subway.ticket_type tt ON UPPER(tt.type_name)   = UPPER(v.type_name)
+JOIN subway.station     s  ON UPPER(s.station_name) = UPPER(v.station_name)
+ON CONFLICT DO NOTHING;
 
 -- Prices are versions: the old single-ride price is closed (valid_to), the new one starts next day.
 INSERT INTO subway.ticket_price (ticket_type_id, price, validity_hours, valid_from, valid_to)
@@ -714,9 +770,8 @@ FROM (VALUES
   ('Day pass',     80.00,  24, DATE '2026-01-01', NULL::date),
   ('Monthly pass', 900.00, 720, DATE '2026-01-01', NULL::date)
 ) AS v (type_name, price, validity_hours, valid_from, valid_to)
-JOIN subway.ticket_type tt ON tt.type_name = v.type_name
-ON CONFLICT DO NOTHING
-RETURNING ticket_price_id, ticket_type_id, price, valid_from, valid_to;
+JOIN subway.ticket_type tt ON UPPER(tt.type_name) = UPPER(v.type_name)
+ON CONFLICT DO NOTHING;
 
 -- The price row is found by the purchase date, so a ticket always gets the price valid that day
 -- (trigger R2 double-checks it). The 2025 ticket keeps the old price after the increase.
@@ -728,7 +783,7 @@ FROM (VALUES
   ('Single ride', TIMESTAMPTZ '2026-11-13 08:17:02+00'),
   ('Day pass',    TIMESTAMPTZ '2026-11-13 09:40:11+00')
 ) AS v (type_name, purchased_at)
-JOIN subway.ticket_type  tt ON tt.type_name = v.type_name
+JOIN subway.ticket_type  tt ON UPPER(tt.type_name) = UPPER(v.type_name)
 JOIN subway.ticket_price tp ON tp.ticket_type_id = tt.ticket_type_id
                            AND (v.purchased_at AT TIME ZONE 'UTC')::date
                                BETWEEN tp.valid_from AND COALESCE(tp.valid_to, DATE 'infinity')
@@ -737,8 +792,7 @@ WHERE NOT EXISTS (
   FROM subway.ticket t
   WHERE t.ticket_price_id = tp.ticket_price_id
     AND t.purchased_at    = v.purchased_at
-)
-RETURNING ticket_id, ticket_price_id, purchased_at;
+);
 
 COMMIT;
 
@@ -759,11 +813,11 @@ FROM (VALUES
   ('Escalator service', NULL::varchar,  'Central Square', NULL::varchar,    NULL::varchar,
      TIMESTAMPTZ '2026-11-15 02:00:00+00', TIMESTAMPTZ '2026-11-15 05:00:00+00', NULL::varchar)
 ) AS v (type_name, train_number, station_name, seg_from, seg_to, planned_start, planned_end, note)
-JOIN subway.maintenance_type mt ON mt.type_name = v.type_name
-LEFT JOIN subway.train       tr ON tr.train_number = v.train_number
-LEFT JOIN subway.station     st ON st.station_name = v.station_name
-LEFT JOIN subway.station     sf ON sf.station_name = v.seg_from
-LEFT JOIN subway.station     sto ON sto.station_name = v.seg_to
+JOIN subway.maintenance_type mt ON UPPER(mt.type_name) = UPPER(v.type_name)
+LEFT JOIN subway.train       tr  ON UPPER(tr.train_number)  = UPPER(v.train_number)
+LEFT JOIN subway.station     st  ON UPPER(st.station_name)  = UPPER(v.station_name)
+LEFT JOIN subway.station     sf  ON UPPER(sf.station_name)  = UPPER(v.seg_from)
+LEFT JOIN subway.station     sto ON UPPER(sto.station_name) = UPPER(v.seg_to)
 LEFT JOIN subway.track_segment sg ON sg.from_station_id = sf.station_id AND sg.to_station_id = sto.station_id
 WHERE NOT EXISTS (
   SELECT 1
@@ -773,8 +827,7 @@ WHERE NOT EXISTS (
     AND w.train_id            IS NOT DISTINCT FROM tr.train_id
     AND w.station_id          IS NOT DISTINCT FROM st.station_id
     AND w.track_segment_id    IS NOT DISTINCT FROM sg.track_segment_id
-)
-RETURNING work_order_id, maintenance_type_id, train_id, station_id, track_segment_id, order_status;
+);
 
 -- Status flow (status and the actual times must change together because of chk_wo_status_times).
 -- The WHERE guards make reruns update 0 rows.
@@ -783,18 +836,16 @@ SET order_status = 'IN_PROGRESS',
     actual_start = w.planned_start + INTERVAL '5 minutes'
 FROM subway.maintenance_type mt
 WHERE mt.maintenance_type_id = w.maintenance_type_id
-  AND mt.type_name IN ('Daily inspection', 'Escalator service')
-  AND w.order_status = 'PLANNED'
-RETURNING w.work_order_id, w.order_status, w.actual_start;
+  AND UPPER(mt.type_name) IN (UPPER('Daily inspection'), UPPER('Escalator service'))
+  AND w.order_status = 'PLANNED';
 
 UPDATE subway.maintenance_work_order w
 SET order_status = 'COMPLETED',
     actual_end   = w.planned_end - INTERVAL '10 minutes'
 FROM subway.maintenance_type mt
 WHERE mt.maintenance_type_id = w.maintenance_type_id
-  AND mt.type_name = 'Daily inspection'
-  AND w.order_status = 'IN_PROGRESS'
-RETURNING w.work_order_id, w.order_status, w.actual_end;
+  AND UPPER(mt.type_name) = UPPER('Daily inspection')
+  AND w.order_status = 'IN_PROGRESS';
 
 COMMIT;
 
@@ -826,7 +877,7 @@ ALTER TABLE subway.work_order_status_history  ADD COLUMN IF NOT EXISTS record_ts
 
 COMMIT;
 
--- 5. CHECKS 
+-- 5. CHECKS
 -- 5.1 record_ts is set for every existing row: null_record_ts must be 0 in every line,
 --     and total_rows must be >= 2 per table (20+ in total).
 SELECT 'service_pattern' AS table_name, COUNT(*) AS total_rows, COUNT(*) FILTER (WHERE record_ts IS NULL) AS null_record_ts FROM subway.service_pattern
