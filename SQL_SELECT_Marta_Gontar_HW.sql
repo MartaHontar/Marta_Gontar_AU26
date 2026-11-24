@@ -1,4 +1,3 @@
-
 -- 1.1 Animation films released 2017-2019 with rental_rate > 1, sorted by title.
 -- Assumptions: rate = rental_rate; BETWEEN includes both years.
 
@@ -50,19 +49,17 @@ WHERE c.name = 'Animation'
 ORDER BY f.title;
 
 -- Pros / cons:
---   CTE:the category filter is named and reusable; - longer, extra step for a simple filter.
---   Subquery:no duplicates possible, no join logic; - three nesting levels are harder to read,
---               and the data of the inner tables cannot be selected.
---   JOIN:shortest, one flat query, planner optimizes it well; - would duplicate rows
---               if a film had several categories (not the case here, the filter is a single category).
+--   CTE: the category filter is named and reusable; - longer, extra step for a simple filter.
+--   Subquery: no duplicates possible, no join logic; - three nesting levels are harder to read,
+--             and the data of the inner tables cannot be selected.
+--   JOIN: shortest, one flat query, planner optimizes it well; - would duplicate rows
+--         if a film had several categories (not the case here, the filter is a single category).
 -- Production: JOIN (simplest, same result, easiest for the planner).
 
 
--- 
 -- 1.2 Revenue of each store since April 2017 (address + address2 as one column).
 -- Assumptions: a payment belongs to the store of the rented inventory item;
 -- address2 is empty/NULL, so NULLIF + CONCAT_WS avoids NULL and trailing space.
-
 
 -- CTE
 -- INNER JOINs inside the CTE keep payments that have a rental and inventory.
@@ -131,19 +128,18 @@ LEFT JOIN public.payment AS p
 GROUP BY s.store_id, a.address, a.address2
 ORDER BY revenue DESC;
 
--- +/-:
---   CTE:aggregates the big payment table first, joins the 2 stores afterwards; - longer.
---   Subquery:no join logic, correlated per store; - nested 3 levels, rerun per store row,
---               address and revenue are separate subqueries.
---   JOIN:one query; - the join of store/inventory/rental/payment is built before
---               grouping (large intermediate result), and the ON-vs-WHERE trap.
+-- Pros / cons:
+--   CTE: aggregates the big payment table first, joins the 2 stores afterwards; - longer.
+--   Subquery: no join logic, correlated per store; - nested 3 levels, rerun per store row,
+--             address and revenue are separate subqueries.
+--   JOIN: one query; - the join of store/inventory/rental/payment is built before
+--         grouping (large intermediate result), and the ON-vs-WHERE trap.
 -- Production: CTE (aggregation before joining the small tables).
 
 
--- 
 -- 1.3 Top-5 actors by number of films released since 2015.
 -- Assumptions: 2015 is included; group by actor_id (names can repeat);
-
+-- WITH TIES keeps actors tied for 5th place.
 
 -- CTE
 -- INNER JOINs drop actors without films since 2015 (they cannot be in the top-5).
@@ -199,16 +195,14 @@ ORDER BY number_of_movies DESC
 FETCH FIRST 5 ROWS WITH TIES;
 
 -- Pros / cons:
---   CTE:each step is named and testable; - longest.
---   Subquery:simple idea; - correlated subquery runs once per actor (200 times), slowest on big data.
---   JOIN:shortest, one pass over the data; - all joined rows are grouped at once.
+--   CTE: each step is named and testable; - longest.
+--   Subquery: simple idea; - correlated subquery runs once per actor (200 times), slowest on big data.
+--   JOIN: shortest, one pass over the data; - all joined rows are grouped at once.
 -- Production: JOIN (one pass, easy to read).
 
 
--- 
 -- 1.4 Number of Drama, Travel and Documentary films per release year, newest year first.
 -- Assumptions: every release_year from film is shown, missing genre count = 0.
-
 
 -- CTE
 -- INNER JOINs in genre_films keep only the 3 genres.
@@ -313,23 +307,25 @@ LEFT JOIN public.category AS c
 GROUP BY f.release_year
 ORDER BY f.release_year DESC;
 
--- +/-:
---   CTE:explicit steps, easy to debug; - 3 CTEs for a simple pivot.
---   Subquery:no join logic; - 3 big copy-pasted subqueries, 3 scans of film per year,
---               a new genre means a new block.
---   JOIN:shortest, tables are read once; - conditional aggregation is less obvious,
---               a film with several categories is counted in each of them (correct here).
--- Production: JOIN .
+-- Pros / cons:
+--   CTE: explicit steps, easy to debug; - 3 CTEs for a simple pivot.
+--   Subquery: no join logic; - 3 big copy-pasted subqueries, 3 scans of film per year,
+--             a new genre means a new block.
+--   JOIN: shortest, tables are read once; - conditional aggregation is less obvious,
+--         a film with several categories is counted in each of them (correct here).
+-- Production: JOIN (one pass, no repeated blocks).
 
 
--- 
 -- 2.1 Top-3 employees by revenue in 2017, with the store of their last payment.
--- Assumptions: last store = store of the inventory item in the staff's latest 2017 payment
+-- Assumptions: last payment = latest payment_date in 2017 (ties broken by the biggest payment_id);
+-- last store = store of the inventory item of that payment;
 -- revenue counts all 2017 payments, LEFT JOINs keep payments without rental;
 -- WITH TIES keeps staff tied for 3rd place.
+-- No window functions are used.
 
 -- CTE
 -- INNER JOINs between the CTEs and staff keep only staff with payments in 2017.
+-- LEFT JOINs in last_store keep the last payment even if it has no rental (store is NULL).
 WITH revenue AS (
     SELECT p.staff_id, SUM(p.amount) AS total_revenue
     FROM public.payment AS p
@@ -337,25 +333,30 @@ WITH revenue AS (
         AND p.payment_date < DATE '2018-01-01'
     GROUP BY p.staff_id
 ),
+last_date AS (
+    SELECT p.staff_id, MAX(p.payment_date) AS last_payment_date
+    FROM public.payment AS p
+    WHERE p.payment_date >= DATE '2017-01-01'
+        AND p.payment_date < DATE '2018-01-01'
+    GROUP BY p.staff_id
+),
+last_payment AS (
+    SELECT p.staff_id, MAX(p.payment_id) AS last_payment_id
+    FROM public.payment AS p
+    INNER JOIN last_date AS ld
+        ON ld.staff_id = p.staff_id
+        AND ld.last_payment_date = p.payment_date
+    GROUP BY p.staff_id
+),
 last_store AS (
-    SELECT t.staff_id, t.store_id
-    FROM (
-        SELECT
-            p.staff_id,
-            i.store_id,
-            ROW_NUMBER() OVER (
-                PARTITION BY p.staff_id
-                ORDER BY p.payment_date DESC, p.payment_id DESC
-            ) AS rn
-        FROM public.payment AS p
-        LEFT JOIN public.rental AS r
-            ON r.rental_id = p.rental_id
-        LEFT JOIN public.inventory AS i
-            ON i.inventory_id = r.inventory_id
-        WHERE p.payment_date >= DATE '2017-01-01'
-            AND p.payment_date < DATE '2018-01-01'
-    ) AS t
-    WHERE t.rn = 1
+    SELECT lp.staff_id, i.store_id
+    FROM last_payment AS lp
+    INNER JOIN public.payment AS p
+        ON p.payment_id = lp.last_payment_id
+    LEFT JOIN public.rental AS r
+        ON r.rental_id = p.rental_id
+    LEFT JOIN public.inventory AS i
+        ON i.inventory_id = r.inventory_id
 )
 SELECT
     s.staff_id,
@@ -407,45 +408,52 @@ ORDER BY total_revenue DESC NULLS LAST
 FETCH FIRST 3 ROWS WITH TIES;
 
 -- JOIN
--- INNER JOIN staff-payment keeps staff with 2017 payments; LEFT JOINs keep payments without rental.
--- Window functions give the total and the last row in one pass.
-SELECT t.staff_id, t.first_name, t.last_name, t.last_store_id, t.total_revenue
-FROM (
+-- INNER JOINs keep staff with 2017 payments; LEFT JOINs keep a last payment without rental.
+-- The total is a normal GROUP BY; the last payment is found by joining payment again
+-- on the latest date (and the biggest payment_id if several payments have the same date).
+SELECT
+    s.staff_id,
+    s.first_name,
+    s.last_name,
+    i.store_id AS last_store_id,
+    rv.total_revenue
+FROM public.staff AS s
+INNER JOIN (
     SELECT
-        s.staff_id,
-        s.first_name,
-        s.last_name,
-        i.store_id AS last_store_id,
-        SUM(p.amount) OVER (PARTITION BY s.staff_id) AS total_revenue,
-        ROW_NUMBER() OVER (
-            PARTITION BY s.staff_id
-            ORDER BY p.payment_date DESC, p.payment_id DESC
-        ) AS rn
-    FROM public.staff AS s
-    INNER JOIN public.payment AS p
-        ON p.staff_id = s.staff_id
-    LEFT JOIN public.rental AS r
-        ON r.rental_id = p.rental_id
-    LEFT JOIN public.inventory AS i
-        ON i.inventory_id = r.inventory_id
+        p.staff_id,
+        SUM(p.amount) AS total_revenue,
+        MAX(p.payment_date) AS last_payment_date
+    FROM public.payment AS p
     WHERE p.payment_date >= DATE '2017-01-01'
         AND p.payment_date < DATE '2018-01-01'
-) AS t
-WHERE t.rn = 1
-ORDER BY t.total_revenue DESC
+    GROUP BY p.staff_id
+) AS rv
+    ON rv.staff_id = s.staff_id
+INNER JOIN public.payment AS lp
+    ON lp.staff_id = rv.staff_id
+    AND lp.payment_date = rv.last_payment_date
+    AND lp.payment_id = (
+        SELECT MAX(p2.payment_id)
+        FROM public.payment AS p2
+        WHERE p2.staff_id = rv.staff_id
+            AND p2.payment_date = rv.last_payment_date
+    )
+LEFT JOIN public.rental AS r
+    ON r.rental_id = lp.rental_id
+LEFT JOIN public.inventory AS i
+    ON i.inventory_id = r.inventory_id
+ORDER BY rv.total_revenue DESC
 FETCH FIRST 3 ROWS WITH TIES;
 
--- +/-:
---   CTE:revenue and last store are separate, simple steps; - payment is scanned twice.
---   Subquery:no joins, no window functions; - the same payment filter is repeated, 2 subqueries per staff.
---   JOIN:one scan of payment; - window functions repeat the total on every row, harder to read.
+-- Pros / cons:
+--   CTE: revenue and last store are separate, simple steps; - payment is scanned several times, 4 CTEs.
+--   Subquery: no joins, no window functions; - the same payment filter is repeated, 2 subqueries per staff.
+--   JOIN: one query; - a derived table plus a correlated tie-break, harder to read.
 -- Production: CTE (clear steps, small result of each step).
-
 
 
 -- 2.2 Top-5 films by number of rentals with the expected audience age of the rating.
 -- Assumptions: films without rentals are not in the top; WITH TIES keeps films tied for 5th place.
-
 
 -- CTE
 -- INNER JOINs inside the CTE keep only rented inventory items.
@@ -523,18 +531,16 @@ GROUP BY f.film_id, f.title, f.rating
 ORDER BY rental_count DESC
 FETCH FIRST 5 ROWS WITH TIES;
 
--- +/-:
---   CTE:counts on the id only, film columns are added after the cut-off logic; - extra step.
---   Subquery:no joins; - correlated count per film, slowest.
---   JOIN:shortest; - GROUP BY on all film columns, wider rows are grouped.
+-- Pros / cons:
+--   CTE: counts on the id only, film columns are added after the aggregation; - extra step.
+--   Subquery: no joins; - correlated count per film, slowest.
+--   JOIN: shortest; - GROUP BY on all film columns, wider rows are grouped.
 -- Production: CTE (narrow aggregation, then a join to film).
 
 
---
 -- 3.1 Actors and the years since their last film.
 -- Assumptions: years_inactive = current year - latest release_year;
 -- actors without films are not shown.
--- 
 
 -- CTE
 -- INNER JOIN drops actors without films.
@@ -602,22 +608,23 @@ INNER JOIN public.film AS f
 GROUP BY a.actor_id, a.first_name, a.last_name
 ORDER BY years_inactive DESC, a.last_name, a.first_name;
 
--- +/-:
---   CTE:aggregates the link table first, joins the names after; - extra step.
---   Subquery:no joins; - nested, a correlated subquery per actor.
---   JOIN:shortest, easiest to read; - groups wider rows (name columns).
+-- Pros / cons:
+--   CTE: aggregates the link table first, joins the names after; - extra step.
+--   Subquery: no joins; - nested, a correlated subquery per actor.
+--   JOIN: shortest, easiest to read; - groups wider rows (name columns).
 -- Production: JOIN (simple and readable, the data is small).
 
 
--- 
 -- 3.2 Gaps between an actor's films.
--- Assumptions: gap-difference between two neighbouring distinct release years of the actor;
+-- Assumptions: gap = difference between two neighbouring distinct release years of the actor;
 -- a gap of 1 means no break; actors with one release year have no gap and are not shown.
--- 
+-- No window functions are used: the "next year" is the smallest year greater than the current one.
 
 -- V1: one row per gap
 
 -- CTE
+-- actor_years keeps each (actor, year) once, so the self-join in gaps is small.
+-- The INNER JOIN drops the last year of an actor (it has no next year).
 WITH actor_years AS (
     SELECT DISTINCT fa.actor_id, f.release_year
     FROM public.film_actor AS fa
@@ -626,10 +633,14 @@ WITH actor_years AS (
 ),
 gaps AS (
     SELECT
-        ay.actor_id,
-        LAG(ay.release_year) OVER (PARTITION BY ay.actor_id ORDER BY ay.release_year) AS prev_year,
-        ay.release_year AS next_year
-    FROM actor_years AS ay
+        ay1.actor_id,
+        ay1.release_year AS prev_year,
+        MIN(ay2.release_year) AS next_year
+    FROM actor_years AS ay1
+    INNER JOIN actor_years AS ay2
+        ON ay2.actor_id = ay1.actor_id
+        AND ay2.release_year > ay1.release_year
+    GROUP BY ay1.actor_id, ay1.release_year
 )
 SELECT
     a.actor_id,
@@ -641,26 +652,32 @@ SELECT
 FROM gaps AS g
 INNER JOIN public.actor AS a
     ON a.actor_id = g.actor_id
-WHERE g.prev_year IS NOT NULL
 ORDER BY gap_years DESC, a.last_name, a.first_name;
 
 -- Subquery
--- No joins: names come from scalar subqueries.
+-- No joins: names and the next year come from scalar subqueries.
+-- The last year of an actor has no next year (NULL) and is removed in the outer WHERE.
 SELECT
     g.actor_id,
     (SELECT a.first_name FROM public.actor AS a WHERE a.actor_id = g.actor_id) AS first_name,
     (SELECT a.last_name FROM public.actor AS a WHERE a.actor_id = g.actor_id) AS last_name,
     g.prev_year,
     g.next_year,
-    g.gap_years
+    g.next_year - g.prev_year AS gap_years
 FROM (
     SELECT
         y.actor_id,
-        LAG(y.release_year) OVER (PARTITION BY y.actor_id ORDER BY y.release_year) AS prev_year,
-        y.release_year AS next_year,
-        y.release_year - LAG(y.release_year) OVER (
-            PARTITION BY y.actor_id ORDER BY y.release_year
-        ) AS gap_years
+        y.release_year AS prev_year,
+        (
+            SELECT MIN(f2.release_year)
+            FROM public.film AS f2
+            WHERE f2.release_year > y.release_year
+                AND f2.film_id IN (
+                    SELECT fa2.film_id
+                    FROM public.film_actor AS fa2
+                    WHERE fa2.actor_id = y.actor_id
+                )
+        ) AS next_year
     FROM (
         SELECT DISTINCT
             fa.actor_id,
@@ -668,8 +685,8 @@ FROM (
         FROM public.film_actor AS fa
     ) AS y
 ) AS g
-WHERE g.gap_years IS NOT NULL
-ORDER BY g.gap_years DESC, last_name, first_name;
+WHERE g.next_year IS NOT NULL
+ORDER BY gap_years DESC, last_name, first_name;
 
 -- JOIN
 -- Self-join without window functions: the next year is the smallest year after the current one.
@@ -693,16 +710,21 @@ INNER JOIN public.film AS f2
 GROUP BY a.actor_id, a.first_name, a.last_name, f1.release_year
 ORDER BY gap_years DESC, a.last_name, a.first_name;
 
--- +/- (V1):
---   CTE:LAG is the natural tool for "previous row", DISTINCT removes repeated years; - two steps.
---   Subquery:no joins; - heavy nesting, LAG repeated twice, names read by scalar subqueries.
---   JOIN:no window functions; - the self-join multiplies rows (films per actor squared)
---               and is hard to read.
--- Production: CTE with LAG.
+-- Pros / cons (V1):
+--   CTE: DISTINCT years first, so the self-join works on a small set; - two steps,
+--        every year is still compared with all later years of the actor.
+--   Subquery: no joins; - heavy nesting, a correlated subquery per actor-year,
+--             names read by scalar subqueries.
+--   JOIN: one query; - the self-join multiplies rows (films per actor squared)
+--         and is hard to read.
+-- Production: CTE (distinct years, then a self-join). If window functions were allowed,
+-- I would use LAG instead, it is shorter and needs no self-join.
 
--- V2: one row per actor 
+
+-- V2: one row per actor
 
 -- CTE
+-- The gaps are built as in V1 (self-join, no window functions), then aggregated per actor.
 WITH actor_years AS (
     SELECT DISTINCT fa.actor_id, f.release_year
     FROM public.film_actor AS fa
@@ -711,11 +733,13 @@ WITH actor_years AS (
 ),
 gaps AS (
     SELECT
-        ay.actor_id,
-        ay.release_year - LAG(ay.release_year) OVER (
-            PARTITION BY ay.actor_id ORDER BY ay.release_year
-        ) AS gap_years
-    FROM actor_years AS ay
+        ay1.actor_id,
+        MIN(ay2.release_year) - ay1.release_year AS gap_years
+    FROM actor_years AS ay1
+    INNER JOIN actor_years AS ay2
+        ON ay2.actor_id = ay1.actor_id
+        AND ay2.release_year > ay1.release_year
+    GROUP BY ay1.actor_id, ay1.release_year
 )
 SELECT
     a.actor_id,
@@ -726,12 +750,12 @@ SELECT
 FROM gaps AS g
 INNER JOIN public.actor AS a
     ON a.actor_id = g.actor_id
-WHERE g.gap_years IS NOT NULL
 GROUP BY a.actor_id, a.first_name, a.last_name
 ORDER BY longest_break_years DESC, a.last_name, a.first_name;
 
 -- Subquery
 -- No joins: names are scalar subqueries on the grouped actor_id.
+-- The last year of an actor has no next year (gap is NULL) and is removed by WHERE.
 SELECT
     g.actor_id,
     (SELECT a.first_name FROM public.actor AS a WHERE a.actor_id = g.actor_id) AS first_name,
@@ -741,9 +765,16 @@ SELECT
 FROM (
     SELECT
         y.actor_id,
-        y.release_year - LAG(y.release_year) OVER (
-            PARTITION BY y.actor_id ORDER BY y.release_year
-        ) AS gap_years
+        (
+            SELECT MIN(f2.release_year)
+            FROM public.film AS f2
+            WHERE f2.release_year > y.release_year
+                AND f2.film_id IN (
+                    SELECT fa2.film_id
+                    FROM public.film_actor AS fa2
+                    WHERE fa2.actor_id = y.actor_id
+                )
+        ) - y.release_year AS gap_years
     FROM (
         SELECT DISTINCT
             fa.actor_id,
@@ -783,7 +814,8 @@ GROUP BY a.actor_id, a.first_name, a.last_name
 ORDER BY longest_break_years DESC, a.last_name, a.first_name;
 
 -- Pros / cons (V2):
---   CTE:simple, reuses the gaps logic of V1; - needs two aggregation levels.
---   Subquery:no joins; - nested 3 levels, harder to maintain.
---   JOIN:no window functions; - self-join cost, still needs a derived table for the second aggregation.
--- Production: CTE with LAG.
+--   CTE: simple, reuses the gaps logic of V1; - needs two aggregation levels.
+--   Subquery: no joins; - nested 3 levels, harder to maintain.
+--   JOIN: one query; - self-join cost, still needs a derived table for the second aggregation.
+-- Production: CTE (distinct years, self-join for the gaps, then aggregation per actor).
+-- If window functions were allowed, I would use LAG in the gaps step.
