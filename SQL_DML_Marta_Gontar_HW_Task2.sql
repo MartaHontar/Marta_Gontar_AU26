@@ -1,13 +1,22 @@
+-- Task 2: how DELETE, VACUUM FULL and TRUNCATE affect time and table size.
+-- Plan: create a big table -> delete 1/3 of the rows -> shrink it with VACUUM FULL ->
+-- recreate it -> TRUNCATE it -> compare. The size query below is re-run after every step.
 
+-- Reusable size query (run after steps 2, 3a, 3c, 3e and 4a):
+--   pg_relation_size       = table data file only
+--   pg_total_relation_size = table + indexes + TOAST
+--   SELECT pg_size_pretty(pg_relation_size('public.table_to_delete'))       AS table_only,
+--          pg_size_pretty(pg_total_relation_size('public.table_to_delete')) AS total,
+--          (SELECT count(*) FROM public.table_to_delete)                    AS row_count;
 
--- 1. Create a test table with 10 million rows (rerunnable thanks to DROP IF EXISTS)
+-- 1. Create a test table with 10 million rows (rerunnable thanks to DROP IF EXISTS).
+--    Each row is a long text value, so the table is big enough (hundreds of MB) to see size changes.
 DROP TABLE IF EXISTS public.table_to_delete;
 CREATE TABLE public.table_to_delete AS
 SELECT 'veeeeeeery_long_string' || x AS col
 FROM generate_series(1,(10^7)::int) x;
 
--- 2. Check the table size (re-run this query after every step below).
---    pg_relation_size = table data file only; pg_total_relation_size = table + indexes + TOAST
+-- 2. Size of the new table (starting point).
 SELECT pg_size_pretty(pg_relation_size('public.table_to_delete'))       AS table_only,
        pg_size_pretty(pg_total_relation_size('public.table_to_delete')) AS total,
        (SELECT count(*) FROM public.table_to_delete)                    AS row_count;
@@ -15,28 +24,42 @@ SELECT pg_size_pretty(pg_relation_size('public.table_to_delete'))       AS table
 
 -- 3a. DELETE every 3rd row (about 3.33 million rows).
 --     The numeric part of the string is extracted with REPLACE and cast to int.
+--     DELETE visits every row, marks the matching ones as dead and writes each change to WAL.
 DELETE FROM public.table_to_delete
 WHERE REPLACE(col,'veeeeeeery_long_string','')::int % 3 = 0;
 -- Time: 23 s
 
--- 3b. Size right after DELETE.
---     Result: 575 MB, unchanged. DELETE only marks tuples as dead (MVCC),
---     the file does not shrink.
+-- 3b. Size right after DELETE (run the size query again).
+SELECT pg_size_pretty(pg_relation_size('public.table_to_delete'))       AS table_only,
+       pg_size_pretty(pg_total_relation_size('public.table_to_delete')) AS total,
+       (SELECT count(*) FROM public.table_to_delete)                    AS row_count;
+-- Result: 575 MB, unchanged; row_count is about 6 666 667.
+-- DELETE only marks tuples as dead (MVCC), because other transactions may still need to see them,
+-- so the file does not shrink.
 
 -- 3c. VACUUM FULL rewrites the table into a new file containing only live rows.
+--     It takes an ACCESS EXCLUSIVE lock (nobody can read the table meanwhile) and needs free disk
+--     space for the new copy, so it is a maintenance command, not a normal cleanup.
 VACUUM FULL VERBOSE public.table_to_delete;
 
--- 3d. Size after VACUUM FULL.
---     Result: 383 MB (about 2/3 of the original, since 1/3 of the rows were deleted).
+-- 3d. Size after VACUUM FULL (run the size query again).
+SELECT pg_size_pretty(pg_relation_size('public.table_to_delete'))       AS table_only,
+       pg_size_pretty(pg_total_relation_size('public.table_to_delete')) AS total,
+       (SELECT count(*) FROM public.table_to_delete)                    AS row_count;
+-- Result: 383 MB (about 2/3 of the original, since 1/3 of the rows were deleted).
 
--- 3e. Recreate the table with the same data to start the TRUNCATE test from the same point.
+-- 3e. Recreate the table with the same data, so the TRUNCATE test starts from the same point
+--     as the DELETE test (same size, same row count).
 DROP TABLE IF EXISTS public.table_to_delete;
 CREATE TABLE public.table_to_delete AS
 SELECT 'veeeeeeery_long_string' || x AS col
 FROM generate_series(1,(10^7)::int) x;
 
--- Size after recreation .
--- Result: 575 MB (same as in step 2, as expected: the same data was loaded again)
+-- Size after recreation (run the size query again).
+SELECT pg_size_pretty(pg_relation_size('public.table_to_delete'))       AS table_only,
+       pg_size_pretty(pg_total_relation_size('public.table_to_delete')) AS total,
+       (SELECT count(*) FROM public.table_to_delete)                    AS row_count;
+-- Result: 575 MB, 10 000 000 rows (same as in step 2, as expected: the same data was loaded again).
 
 -- Demo: TRUNCATE is transactional in PostgreSQL.
 -- Inside the transaction the table is empty (count = 0); after ROLLBACK all
@@ -52,17 +75,29 @@ SELECT count(*) FROM public.table_to_delete;     -- 10 000 000 again
 TRUNCATE public.table_to_delete;
 -- Time: 0.105 s
 
--- 4b. Comparison DELETE vs TRUNCATE
---   Time:      DELETE 23 s for only 1/3 of the rows (visits each row, writes WAL per row);
---              TRUNCATE 0.105 s for ALL rows (swaps the data file, no row-by-row work).
---   Space:     DELETE: table stays 575 MB until VACUUM FULL, which then gives 383 MB;
---              TRUNCATE: space is released immediately, no VACUUM needed.
---   Features:  DELETE supports WHERE and fires row-level triggers, takes row locks;
---              TRUNCATE removes everything, no WHERE, takes ACCESS EXCLUSIVE lock.
+-- 4b. Comparison DELETE vs TRUNCATE (numbers are the ones measured above).
+--   What it does:  DELETE removes the rows that match WHERE, one by one.
+--                  TRUNCATE removes ALL rows at once by replacing the table's data file.
+--   Time:          DELETE: 23 s for only 1/3 of the rows (checks each row, writes WAL per row).
+--                  TRUNCATE: 0.105 s for ALL rows (no row-by-row work); about 200 times faster
+--                  even though it removed three times more rows.
+--   Space:         DELETE: the table stays 575 MB (dead tuples remain) until VACUUM FULL, which
+--                  then gives 383 MB for the remaining 2/3 of the rows.
+--                  TRUNCATE: space is released immediately, table part 0 bytes, no VACUUM needed.
+--   WHERE:         DELETE can remove only some rows; TRUNCATE cannot, it is all or nothing.
+--   Triggers:      DELETE fires row-level triggers; TRUNCATE does not fire them (only
+--                  TRUNCATE triggers).
+--   Locks:         DELETE takes row locks and other sessions can still read the table;
+--                  TRUNCATE takes an ACCESS EXCLUSIVE lock for the whole table.
+--   Rollback:      both can be rolled back inside an open transaction; after COMMIT neither can.
+--   Use:           DELETE for removing part of the data; TRUNCATE to empty a table completely.
 
--- 4c. Size after TRUNCATE (re-run the size query from step 2).
---     Table part: 0 bytes. Total: 8 kB (the empty TOAST table / its index still occupy
---     pages, so the total is not exactly 0).
+-- 4c. Size after TRUNCATE (run the size query again).
+SELECT pg_size_pretty(pg_relation_size('public.table_to_delete'))       AS table_only,
+       pg_size_pretty(pg_total_relation_size('public.table_to_delete')) AS total,
+       (SELECT count(*) FROM public.table_to_delete)                    AS row_count;
+-- Result: table part 0 bytes, total 8 kB (the empty TOAST table / its index still occupy
+-- pages, so the total is not exactly 0), 0 rows.
 
 /* 5. CONCLUSIONS
    Time:        DELETE slow (row by row); TRUNCATE near-instant.
